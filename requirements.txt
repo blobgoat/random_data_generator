@@ -1,0 +1,5 @@
+# Both are optional -- the script works with neither installed, but:
+#   - pyyaml is needed if you use a .yaml/.yml config (use .json otherwise)
+#   - faker gives much more realistic names/emails than the built-in lists
+pyyaml
+faker

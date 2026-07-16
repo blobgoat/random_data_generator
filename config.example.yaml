@@ -1,0 +1,89 @@
+# config.example.yaml
+#
+# Example config for generate_data.py. It defines three tables:
+#   - users        100 rows, with a unique numeric id and a random name
+#   - products       20 rows, with a unique numeric id, name, and price
+#   - orders        300 rows, referencing users (1-N) and linked to
+#                    products through a many-to-many join table
+#
+# Run it with:
+#   python generate_data.py --config config.example.yaml --outdir ./output --seed 42
+
+tables:
+  users:
+    rows: 100
+    fields:
+      user_id:
+        type: number
+        digits: 5
+        unique: true          # no two users share an id
+      full_name:
+        type: name
+      email:
+        type: email
+      signup_date:
+        type: date
+        start: "2022-01-01"
+        end: "2026-07-16"
+      is_active:
+        type: boolean
+      plan_tier:
+        type: choice            # picks one of these strings at random
+        values: ["free", "basic", "pro", "enterprise"]
+
+  products:
+    rows: 20
+    fields:
+      product_id:
+        type: number
+        digits: 4
+        unique: true
+      product_name:
+        type: name             # stand-in for a product name generator
+      price:
+        type: number
+        digits: 3
+
+  orders:
+    rows: 300
+    fields:
+      order_id:
+        type: number
+        digits: 6
+        unique: true
+      order_date:
+        type: date
+        start: "2025-01-01"
+        end: "2026-07-16"
+      status:
+        type: choice
+        values: ["pending", "shipped", "delivered", "cancelled"]
+      # NOTE: no "user_id" field is declared here -- it gets created
+      # automatically by the 1-N relation below.
+
+relations:
+  # One user (the "1" side) can place many orders (the "N" side).
+  # This adds a new "user_id" column to `orders`, filled with values
+  # drawn from `users.user_id`.
+  - type: "1-N"
+    left:
+      table: users
+      field: user_id
+    right:
+      table: orders
+      field: user_id
+
+  # Orders and products are many-to-many (an order can contain several
+  # products, and a product can appear on many orders), so this creates
+  # a brand-new join table `orders_products.csv` instead of touching
+  # either original table.
+  - type: "N-N"
+    left:
+      table: orders
+      field: order_id
+    right:
+      table: products
+      field: product_id
+    join_table: orders_products
+    join_rows: 600
+    unique_pairs: true
