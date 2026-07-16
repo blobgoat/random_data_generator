@@ -490,7 +490,7 @@ def main():
         help="Path to a JSON or YAML config file",
     )
     parser.add_argument(
-        "--outdir", default="./output",
+        "--outdir", default="../output",
         help="Directory to write CSVs into",
     )
     parser.add_argument(
