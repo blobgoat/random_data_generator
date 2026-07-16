@@ -17,7 +17,12 @@ WHAT IT DOES
    keeps re-rolling that field until it produces a value that hasn't
    been used yet in that column, so you get valid unique IDs.
 
-3. You can describe "relations" between two tables so that the CSVs
+3. A table can hard-code some of its rows with `static_rows` instead of
+   (or alongside) `rows: N` -- handy for things like a fixed product
+   catalog where you want to list every product by name yourself but
+   still have an id or price randomly generated for each one.
+
+4. You can describe "relations" between two tables so that the CSVs
    reference each other, exactly like foreign keys in a real database:
        - "1-1"  every row in table A maps to exactly one row in table B
        - "1-N"  many rows in table A can point at the same row in table B
@@ -41,9 +46,19 @@ CONFIG FORMAT (YAML or JSON)
 tables:
   <table_name>:
     rows: <int>                      # how many rows to generate
+    static_rows:                     # OPTIONAL: hard-code some rows
+      - <column_name>: <value>       # instead of `rows: N`, provide N
+        ...                          # of these -- row count = list
+                                      # length. Each entry sets one or
+                                      # more declared fields to a fixed
+                                      # value for that row; any declared
+                                      # field NOT set in the entry is
+                                      # still randomly generated as usual
+                                      # (every column named here must
+                                      # also appear under `fields:` below)
     fields:
       <column_name>:
-        type: name | number | boolean | email | date | choice
+        type: name | number | boolean | email | date | choice | hash
         unique: true|false           # optional, default false
 
         # --- "number" specific options ---
@@ -58,6 +73,20 @@ tables:
                                       # gets one picked at random (with
                                       # replacement, so values can repeat
                                       # across rows unless unique: true)
+
+        # --- "hash" specific options ---
+        # Combines one or more OTHER fields from the same row into a
+        # single deterministic hash -- handy as a composite/derived UID.
+        # Referenced fields must be declared earlier in this table's
+        # `fields:` list (so their value already exists for the row).
+        fields: [<column_name>, ...]  # required, 1+ existing field names
+        algorithm: sha256 | sha1 | md5 | blake2b | ...  # optional,
+                                      # default sha256 (any hashlib name)
+        length: <int>                 # optional, truncate the hex digest
+                                       # to this many characters
+        encoding: hex | int           # optional, default hex (string);
+                                       # "int" returns the digest as an
+                                       # integer instead
 
 relations:
   - type: "1-1" | "1-N" | "N-N"
@@ -89,6 +118,7 @@ relations:
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import string
@@ -155,13 +185,16 @@ def load_config(path: Path) -> dict:
 # Field generators
 # ---------------------------------------------------------------------------
 # Each generator function has the signature:
-#     generator(field_spec: dict, rng: random.Random) -> value
+#     generator(field_spec: dict, rng: random.Random, row: dict) -> value
 #
 # `field_spec` is the dict for that field straight out of the config
-# (e.g. {"type": "number", "digits": 4, "unique": True}), and `rng` is a
-# random.Random instance so results are reproducible with --seed.
+# (e.g. {"type": "number", "digits": 4, "unique": True}), `rng` is a
+# random.Random instance so results are reproducible with --seed, and
+# `row` holds the values already generated for OTHER fields in this same
+# row (in field-declaration order) -- most generators ignore it, but it's
+# what lets `hash` derive a value from its sibling fields.
 
-def gen_name(field_spec: dict, rng: random.Random):
+def gen_name(field_spec: dict, rng: random.Random, row: dict):
     """Random full name."""
     if _HAS_FAKER and _faker is not None:
         return _faker.name()
@@ -170,7 +203,7 @@ def gen_name(field_spec: dict, rng: random.Random):
     return f"{first} {last}"
 
 
-def gen_number(field_spec: dict, rng: random.Random):
+def gen_number(field_spec: dict, rng: random.Random, row: dict):
     """
     Random integer with a specific number of digits.
 
@@ -187,12 +220,12 @@ def gen_number(field_spec: dict, rng: random.Random):
     return rng.randint(low, high)
 
 
-def gen_boolean(field_spec: dict, rng: random.Random):
+def gen_boolean(field_spec: dict, rng: random.Random, row: dict):
     """Random True/False."""
     return rng.choice([True, False])
 
 
-def gen_email(field_spec: dict, rng: random.Random):
+def gen_email(field_spec: dict, rng: random.Random, row: dict):
     """Random email address."""
     if _HAS_FAKER:
         return _faker.email() if _faker else None
@@ -201,7 +234,7 @@ def gen_email(field_spec: dict, rng: random.Random):
     return f"{local}@{domain}"
 
 
-def gen_choice(field_spec: dict, rng: random.Random):
+def gen_choice(field_spec: dict, rng: random.Random, row: dict):
     """
     Pick one random value out of a user-supplied list.
 
@@ -221,7 +254,7 @@ def gen_choice(field_spec: dict, rng: random.Random):
     return rng.choice(values)
 
 
-def gen_date(field_spec: dict, rng: random.Random):
+def gen_date(field_spec: dict, rng: random.Random, row: dict):
     """Random date (as an ISO string) between `start` and `end`."""
     start = _parse_date(field_spec.get("start", "2000-01-01"))
     end = _parse_date(
@@ -232,6 +265,62 @@ def gen_date(field_spec: dict, rng: random.Random):
         raise ValueError("`start` date must be before `end` date")
     offset = rng.randint(0, span_days)
     return (start + timedelta(days=offset)).isoformat()
+
+
+def gen_hash(field_spec: dict, rng: random.Random, row: dict):
+    """
+    Combine one or more already-generated fields from this same row into
+    a single deterministic hash -- useful as a composite/derived UID.
+
+    Config:
+        row_uid:
+          type: hash
+          fields: ["order_id", "order_date", "status"]
+          algorithm: sha256   # optional, default sha256 (any hashlib name)
+          length: 12          # optional, truncate the hex digest
+          encoding: hex       # optional, "hex" (default) or "int"
+
+    The referenced fields must be declared EARLIER in this table's
+    `fields:` list, since fields are generated top-to-bottom and this
+    reads their already-generated values out of `row`. Note this is
+    deterministic given those fields' values, so pairing it with
+    `unique: true` only helps if the referenced fields vary enough to
+    avoid collisions -- retries won't change the result on their own.
+    """
+    field_names = field_spec.get("fields")
+    if not field_names or not isinstance(field_names, list):
+        raise ValueError(
+            "`hash` fields require a non-empty `fields` list naming the "
+            "columns to combine, e.g. `fields: [\"user_id\", \"order_id\"]`"
+        )
+    missing = [name for name in field_names if name not in row]
+    if missing:
+        raise ValueError(
+            f"`hash` field references field(s) {missing} that aren't "
+            "available yet. Declare those fields earlier in this "
+            "table's `fields:` list."
+        )
+
+    algorithm = field_spec.get("algorithm", "sha256")
+    try:
+        hasher = hashlib.new(algorithm)
+    except ValueError:
+        raise ValueError(
+            f"Unknown hash algorithm '{algorithm}'. Valid options include "
+            f"{sorted(hashlib.algorithms_guaranteed)}"
+        ) from None
+
+    combined = "|".join(str(row[name]) for name in field_names)
+    hasher.update(combined.encode("utf-8"))
+    digest = hasher.hexdigest()
+
+    length = field_spec.get("length")
+    if length is not None:
+        digest = digest[:int(length)]
+
+    if field_spec.get("encoding", "hex") == "int":
+        return int(digest, 16)
+    return digest
 
 
 def _parse_date(value: str) -> date:
@@ -248,6 +337,7 @@ FIELD_GENERATORS = {
     "email": gen_email,
     "date": gen_date,
     "choice": gen_choice,
+    "hash": gen_hash,
 }
 
 # Safety valve: how many times we'll retry a field before giving up on
@@ -257,7 +347,7 @@ MAX_UNIQUE_ATTEMPTS = 10_000
 
 
 def generate_field_value(field_name: str, field_spec: dict,
-                         rng: random.Random, used_values: set):
+                         rng: random.Random, used_values: set, row: dict):
     """Generate one value for a field, honoring `unique: true` if set."""
     ftype = field_spec.get("type")
     if ftype not in FIELD_GENERATORS:
@@ -268,10 +358,10 @@ def generate_field_value(field_name: str, field_spec: dict,
     generator = FIELD_GENERATORS[ftype]
 
     if not field_spec.get("unique", False):
-        return generator(field_spec, rng)
+        return generator(field_spec, rng, row)
 
     for _ in range(MAX_UNIQUE_ATTEMPTS):
-        value = generator(field_spec, rng)
+        value = generator(field_spec, rng, row)
         if value not in used_values:
             used_values.add(value)
             return value
@@ -295,11 +385,48 @@ def generate_table(
     Returns a dict of {column_name: [values...]} -- i.e. columns stored
     as parallel lists, which makes it cheap to append new foreign-key
     columns later when relations are applied.
+
+    Normally every field on every row is randomly generated. If the
+    table also has a `static_rows` list, each entry in it hard-codes one
+    or more column values for exactly one row (see `static_rows` below)
+    -- any field NOT covered by that entry still falls back to its
+    normal generator.
     """
-    row_count = int(table_spec.get("rows", 0))
     fields = table_spec.get("fields", {})
     if not fields:
         raise ValueError(f"Table '{table_name}' has no fields defined")
+
+    static_rows = table_spec.get("static_rows")
+    if static_rows is not None:
+        if not isinstance(static_rows, list) or not static_rows:
+            raise ValueError(
+                f"Table '{table_name}': `static_rows` must be a "
+                "non-empty list of {column_name: value} rows"
+            )
+        for i, entry in enumerate(static_rows):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"Table '{table_name}': `static_rows[{i}]` must be a "
+                    "mapping of column_name: value"
+                )
+            unknown = [name for name in entry if name not in fields]
+            if unknown:
+                raise ValueError(
+                    f"Table '{table_name}': `static_rows[{i}]` sets "
+                    f"undeclared column(s) {unknown}. Every column used "
+                    "in `static_rows` must also be declared under "
+                    "`fields`."
+                )
+        declared_rows = table_spec.get("rows")
+        if declared_rows is not None and int(declared_rows) != len(static_rows):
+            print(
+                f"[warn] table '{table_name}': `rows: {declared_rows}` is "
+                f"ignored in favor of `static_rows`'s {len(static_rows)} "
+                "entries."
+            )
+        row_count = len(static_rows)
+    else:
+        row_count = int(table_spec.get("rows", 0))
 
     columns: dict[str, list] = {field_name: [] for field_name in fields}
     used_values_by_field: dict[str, set] = {
@@ -307,12 +434,33 @@ def generate_table(
         for field_name, spec in fields.items()
         if spec.get("unique", False)
     }
+    # Seed uniqueness tracking with any values supplied via `static_rows`
+    # so randomly-generated rows don't collide with the ones you already
+    # hard-coded.
+    if static_rows:
+        for entry in static_rows:
+            for field_name, value in entry.items():
+                if field_name in used_values_by_field:
+                    used_values_by_field[field_name].add(value)
 
-    for _ in range(row_count):
+    for i in range(row_count):
+        static_entry = static_rows[i] if static_rows else {}
+        row: dict = {}
         for field_name, field_spec in fields.items():
-            used_values = used_values_by_field.get(field_name, set())
-            value = generate_field_value(field_name, field_spec, rng,
-                                         used_values)
+            if field_name in static_entry:
+                value = static_entry[field_name]
+            else:
+                if "type" not in field_spec:
+                    raise ValueError(
+                        f"Table '{table_name}', row {i}: field "
+                        f"'{field_name}' has no static value and no "
+                        "`type` to generate one. Either add it to every "
+                        "`static_rows` entry or give it a `type`."
+                    )
+                used_values = used_values_by_field.get(field_name, set())
+                value = generate_field_value(field_name, field_spec, rng,
+                                             used_values, row)
+            row[field_name] = value
             columns[field_name].append(value)
 
     return columns
@@ -510,9 +658,9 @@ def main():
     # 1. Generate every table's own fields first (no foreign keys yet).
     tables = {}
     for table_name, table_spec in config.get("tables", {}).items():
-        print(f"Generating table '{table_name}' ({table_spec.get('rows', 0)} "
-              + "rows)...")
+        print(f"Generating table '{table_name}'...")
         tables[table_name] = generate_table(table_name, table_spec, rng)
+        print(f"  -> {_row_count(tables[table_name])} rows")
 
     # 2. Apply relations: fills in FK columns for 1-1/1-N, and builds any
     #    N-N join tables.

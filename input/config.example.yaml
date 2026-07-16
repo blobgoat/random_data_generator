@@ -1,13 +1,14 @@
 # config.example.yaml
 #
 # Example config for generate_data.py. It defines three tables:
-#   - users        100 rows, with a unique numeric id and a random name
-#   - products       20 rows, with a unique numeric id, name, and price
-#   - orders        300 rows, referencing users (1-N) and linked to
-#                    products through a many-to-many join table
+#   - users          100 rows, with a unique numeric id and a random name
+#   - products         8 static rows (named products), each with a
+#                       random unique id and a random price
+#   - orders         300 rows, referencing users (1-N) and linked to
+#                     products through a many-to-many join table
 #
-# Run it with:
-#   python generate_data.py --config config.example.yaml --outdir ./output --seed 42
+# Run it with (from the project root):
+#   python generate_data.py --config input/config.example.yaml --outdir ./output --seed 42
 
 tables:
   users:
@@ -16,7 +17,7 @@ tables:
       user_id:
         type: number
         digits: 5
-        unique: true          # no two users share an id
+        unique: true # no two users share an id
       full_name:
         type: name
       email:
@@ -28,18 +29,31 @@ tables:
       is_active:
         type: boolean
       plan_tier:
-        type: choice            # picks one of these strings at random
+        type: choice # picks one of these strings at random
         values: ["free", "basic", "pro", "enterprise"]
 
   products:
-    rows: 20
+    # `static_rows` hard-codes the product catalog by name -- row count
+    # comes from this list (8 rows here), not from a `rows:` key. Any
+    # declared field NOT set in an entry (product_id, price) still gets
+    # randomly generated per row, so every product gets its own random
+    # id and price.
+    static_rows:
+      - product_name: "Widget"
+      - product_name: "Gadget"
+      - product_name: "Gizmo"
+      - product_name: "Sprocket"
+      - product_name: "Doohickey"
+      - product_name: "Thingamajig"
+      - product_name: "Contraption"
+      - product_name: "Whatsit"
     fields:
       product_id:
         type: number
         digits: 4
         unique: true
       product_name:
-        type: name             # stand-in for a product name generator
+        type: name # unused here -- every row supplies this via static_rows
       price:
         type: number
         digits: 3
@@ -58,6 +72,10 @@ tables:
       status:
         type: choice
         values: ["pending", "shipped", "delivered", "cancelled"]
+      row_uid:
+        type: hash # combines the fields below into one UID
+        fields: [order_id, order_date, status]
+        length: 12 # truncate the sha256 digest to 12 chars
       # NOTE: no "user_id" field is declared here -- it gets created
       # automatically by the 1-N relation below.
 
