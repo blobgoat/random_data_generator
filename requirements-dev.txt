@@ -1,0 +1,8 @@
+# Dev-only dependencies -- not needed to run generate_data.py, only to
+# type-check it locally.
+#
+#   pip install -r requirements-dev.txt
+#   mypy generate_data.py
+
+mypy
+types-PyYAML

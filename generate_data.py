@@ -58,8 +58,21 @@ tables:
                                       # also appear under `fields:` below)
     fields:
       <column_name>:
-        type: name | number | boolean | email | date | choice | hash
+        type: name | number | boolean | email | date | choice | hash |
+              phone | address | text
         unique: true|false           # optional, default false
+
+        # --- nullable, works on ANY field type ---
+        nullable: true|false         # optional, default false. If true,
+                                      # this field is blank ("") some of
+                                      # the time instead of always calling
+                                      # its normal generator.
+        null_chance: <0.0-1.0>       # optional, default 0.5. Probability
+                                      # of being blank on any given row,
+                                      # only used when nullable: true.
+                                      # (Blank values never count against
+                                      # `unique: true`'s uniqueness check,
+                                      # same as NULL in a real database.)
 
         # --- "number" specific options ---
         digits: <int>                # e.g. digits: 4 -> values 1000-9999
@@ -110,10 +123,67 @@ relations:
       table: <table_name>
       field: <column_name>
 
+    # --- "1-N" specific options ---
+    min_per_left: <int>      # optional. Minimum number of right-table rows
+                              # each left-table value must end up with.
+    max_per_left: <int>      # optional. Maximum number of right-table rows
+                              # each left-table value may end up with.
+                              # If NEITHER is given, each right row just
+                              # picks any left value independently at
+                              # random (the original behavior) -- no
+                              # guarantee about how many rows any one left
+                              # value ends up with. If the right table's
+                              # fixed row count can't exactly satisfy the
+                              # requested min/max for every left value, the
+                              # generator does its best and prints a
+                              # [warn] describing the shortfall/overflow.
+
     # --- "N-N" specific options (ignored for 1-1 / 1-N) ---
     join_table: <name>       # optional, defaults to "<left>_<right>"
-    join_rows: <int>         # optional, how many link rows to generate
+    join_rows: <int>         # optional, how many link rows to generate.
+                              # Ignored if any of the min_per_*/max_per_*
+                              # options below are set.
     unique_pairs: true|false # optional, default true (no duplicate links)
+    left_as: <column_name>   # optional, rename the left key column in the
+                              # join table (default "<left_table>_<field>")
+    right_as: <column_name>  # optional, same idea for the right key column
+    exclude_self: true|false # optional, default false. When left_table and
+                              # right_table are the SAME table (a self-join,
+                              # e.g. an org-chart "reports_to" table), set
+                              # this to skip pairs where the two picks are
+                              # identical so a row never points at itself.
+    min_per_left: <int>      # optional. Minimum number of join rows each
+    max_per_left: <int>      # optional. left-table value must appear in.
+    min_per_right: <int>     # optional. Same idea, but counting how many
+    max_per_right: <int>     # optional. join rows each right-table value
+                              # appears in.
+                              # Any of these four may be set independently;
+                              # an unset bound is treated as "no limit" on
+                              # that side. Setting any of them switches the
+                              # join from the old "just generate join_rows
+                              # random pairs" mode into a degree-controlled
+                              # mode that tries to give every left/right
+                              # value a connection count inside its bounds
+                              # (each value's own target degree is chosen
+                              # uniformly at random within [min, max]).
+                              # This is a best-effort process -- if the two
+                              # tables' sizes make the requested bounds
+                              # infeasible (e.g. min_per_left too high for
+                              # how many right values exist), a [warn] is
+                              # printed reporting how many values fell
+                              # short of their minimum.
+    fields:                  # optional -- attach extra columns to the join
+                              # table itself, e.g. a relationship's own
+                              # attributes (a skill "level", a
+                              # "readiness_score", dates). Uses the exact
+                              # same mini-language as a table's `fields:`
+                              # block above, and can reference the join's
+                              # own left_as/right_as columns (e.g. via
+                              # `type: hash`) to build a composite key from
+                              # both sides of the link.
+      <column_name>:
+        type: ...
+        ...
 """
 
 import argparse
@@ -327,6 +397,53 @@ def _parse_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
+def gen_phone(field_spec: dict, rng: random.Random, row: dict):
+    """Random phone number."""
+    if _HAS_FAKER and _faker is not None:
+        return _faker.phone_number()
+    area = rng.randint(200, 999)
+    prefix = rng.randint(200, 999)
+    line = rng.randint(1000, 9999)
+    return f"({area}) {prefix}-{line}"
+
+
+def gen_address(field_spec: dict, rng: random.Random, row: dict):
+    """Random street address (single line)."""
+    if _HAS_FAKER and _faker is not None:
+        return _faker.address().replace("\n", ", ")
+    state = rng.choice(["CA", "TX", "NY", "OH", "WA", "IL", "CO", "GA"])
+    return (
+        f"{rng.randint(100, 9999)} Main St, Springfield, {state} "
+        f"{rng.randint(10000, 99999)}"
+    )
+
+
+_TEXT_FALLBACK_WORDS = [
+    "deliver", "strategic", "cross-functional", "leadership", "initiative",
+    "stakeholder", "execution", "capability", "impact", "scalable",
+    "customer-focused", "operational", "growth", "collaborative", "roadmap",
+]
+
+
+def gen_text(field_spec: dict, rng: random.Random, row: dict):
+    """
+    Random free-text sentence(s) -- useful for abstract statements,
+    interpretations, notes, etc.
+
+        interpretation:
+          type: text
+          sentences: 2   # optional, default 1
+    """
+    sentences = int(field_spec.get("sentences", 1))
+    if _HAS_FAKER and _faker is not None:
+        return " ".join(_faker.sentence() for _ in range(sentences))
+    out = []
+    for _ in range(sentences):
+        words = rng.choices(_TEXT_FALLBACK_WORDS, k=7)
+        out.append(" ".join(words).capitalize() + ".")
+    return " ".join(out)
+
+
 # Registry mapping the `type:` string in the config to its generator
 # function. Add your own entry here (e.g. "phone": gen_phone) to extend
 # the tool with new field types.
@@ -338,6 +455,9 @@ FIELD_GENERATORS = {
     "date": gen_date,
     "choice": gen_choice,
     "hash": gen_hash,
+    "phone": gen_phone,
+    "address": gen_address,
+    "text": gen_text,
 }
 
 # Safety valve: how many times we'll retry a field before giving up on
@@ -348,7 +468,17 @@ MAX_UNIQUE_ATTEMPTS = 10_000
 
 def generate_field_value(field_name: str, field_spec: dict,
                          rng: random.Random, used_values: set, row: dict):
-    """Generate one value for a field, honoring `unique: true` if set."""
+    """
+    Generate one value for a field, honoring `unique: true` and
+    `nullable: true` if set.
+
+    `nullable: true` works on top of ANY field type -- on each row, before
+    calling the type's generator at all, we roll against `null_chance`
+    (default 0.5) and return "" if it hits. A blank value is never checked
+    against `used_values`, since (like a real database) multiple NULLs in
+    a "unique" column are fine -- it's only non-blank duplicates we guard
+    against.
+    """
     ftype = field_spec.get("type")
     if ftype not in FIELD_GENERATORS:
         raise ValueError(
@@ -357,10 +487,22 @@ def generate_field_value(field_name: str, field_spec: dict,
         )
     generator = FIELD_GENERATORS[ftype]
 
+    nullable = field_spec.get("nullable", False)
+    null_chance = float(field_spec.get("null_chance", 0.5))
+    if nullable and not (0.0 <= null_chance <= 1.0):
+        raise ValueError(
+            f"`null_chance` for field '{field_name}' must be between 0 "
+            "and 1"
+        )
+
     if not field_spec.get("unique", False):
+        if nullable and rng.random() < null_chance:
+            return ""
         return generator(field_spec, rng, row)
 
     for _ in range(MAX_UNIQUE_ATTEMPTS):
+        if nullable and rng.random() < null_chance:
+            return ""
         value = generator(field_spec, rng, row)
         if value not in used_values:
             used_values.add(value)
@@ -418,7 +560,10 @@ def generate_table(
                     "`fields`."
                 )
         declared_rows = table_spec.get("rows")
-        if declared_rows is not None and int(declared_rows) != len(static_rows):
+        if (
+            declared_rows is not None
+            and int(declared_rows) != len(static_rows)
+        ):
             print(
                 f"[warn] table '{table_name}': `rows: {declared_rows}` is "
                 f"ignored in favor of `static_rows`'s {len(static_rows)} "
@@ -503,12 +648,87 @@ def apply_relation_one_to_one(tables: dict, rel: dict, rng: random.Random):
     tables[right_table][right_field] = paired
 
 
+def _assign_with_degree_bounds(
+    pool: list, slot_count: int, min_deg: int, max_deg: int,
+    rng: random.Random, context: str,
+) -> list:
+    """
+    Fill `slot_count` slots with values from `pool` such that every
+    DISTINCT value in `pool` ends up used between `min_deg` and `max_deg`
+    times, as closely as this is possible given `slot_count`.
+
+    Two-phase greedy approach:
+      1. Hand out `min_deg` copies of every pool value first (in random
+         order), so minimums are met whenever there's room for them.
+      2. Randomly fill any remaining slots, preferring values that
+         haven't hit `max_deg` yet.
+
+    If `slot_count` can't fit every value's minimum, or exceeds what
+    every value's maximum can absorb, we do our best and print a [warn]
+    -- this is a best-effort random fill, not a strict solver.
+    """
+    pool_unique = list(dict.fromkeys(pool))
+    n = len(pool_unique)
+    if n == 0:
+        raise ValueError(f"{context}: left table has no rows to assign from")
+    if min_deg > max_deg:
+        raise ValueError(
+            f"{context}: min_per_left ({min_deg}) > max_per_left ({max_deg})"
+        )
+
+    if min_deg * n > slot_count:
+        print(
+            f"[warn] {context}: min_per_left={min_deg} would need at least "
+            f"{min_deg * n} rows on the many side, but only {slot_count} "
+            "exist; some left values will end up below the minimum."
+        )
+    if max_deg * n < slot_count:
+        print(
+            f"[warn] {context}: max_per_left={max_deg} allows at most "
+            f"{max_deg * n} rows on the many side, but {slot_count} need "
+            "assigning; some left values will exceed the maximum so every "
+            "row still gets a value."
+        )
+
+    remaining = {v: 0 for v in pool_unique}
+    assignments: list = []
+
+    order = pool_unique[:]
+    rng.shuffle(order)
+    for v in order:
+        if len(assignments) >= slot_count:
+            break
+        give = min(min_deg, slot_count - len(assignments))
+        assignments.extend([v] * give)
+        remaining[v] += give
+
+    while len(assignments) < slot_count:
+        candidates = [v for v in pool_unique if remaining[v] < max_deg]
+        if not candidates:
+            # Everyone is already at max_deg but rows remain -- ignore the
+            # cap so every row still gets assigned a value.
+            candidates = pool_unique
+        v = rng.choice(candidates)
+        assignments.append(v)
+        remaining[v] += 1
+
+    rng.shuffle(assignments)
+    return assignments[:slot_count]
+
+
 def apply_relation_one_to_many(tables: dict, rel: dict, rng: random.Random):
     """
-    Each row of the right ("many") table is randomly assigned one value
-    from the left ("one") table's key column, WITH replacement -- so
-    several right-table rows can end up pointing at the same left-table
-    row, which is exactly what a normal foreign key looks like.
+    Each row of the right ("many") table gets one value from the left
+    ("one") table's key column, WITH replacement -- so several
+    right-table rows can end up pointing at the same left-table row,
+    which is exactly what a normal foreign key looks like.
+
+    By default (no `min_per_left`/`max_per_left`), each right row just
+    picks any left value independently at random, with no guarantee about
+    how many rows end up pointing at any one left value. Set
+    `min_per_left` and/or `max_per_left` to instead cap/guarantee how many
+    right-table rows each left value gets, e.g. "every role has 2-5
+    candidates."
     """
     left_table, left_field = rel["left"]["table"], rel["left"]["field"]
     right_table, right_field = rel["right"]["table"], rel["right"]["field"]
@@ -516,9 +736,167 @@ def apply_relation_one_to_many(tables: dict, rel: dict, rng: random.Random):
     left_values = tables[left_table][left_field]
     right_rows = _row_count(tables[right_table])
 
-    tables[right_table][right_field] = [
-        rng.choice(left_values) for _ in range(right_rows)
-    ]
+    min_per_left = rel.get("min_per_left")
+    max_per_left = rel.get("max_per_left")
+
+    if min_per_left is None and max_per_left is None:
+        tables[right_table][right_field] = [
+            rng.choice(left_values) for _ in range(right_rows)
+        ]
+        return
+
+    min_per_left = int(min_per_left) if min_per_left is not None else 0
+    max_per_left = (
+        int(max_per_left) if max_per_left is not None else right_rows
+    )
+    context = f"1-N {left_table}.{left_field} -> {right_table}.{right_field}"
+    tables[right_table][right_field] = _assign_with_degree_bounds(
+        left_values, right_rows, min_per_left, max_per_left, rng, context
+    )
+
+
+def _random_pairs_by_count(
+    left_values: list, right_values: list, join_rows: int,
+    unique_pairs: bool, exclude_self: bool, join_table_name: str,
+    rng: random.Random,
+) -> list:
+    """
+    Original N-N strategy: just throw `join_rows` random (left, right)
+    darts, keeping only unique ones if `unique_pairs` is set. No control
+    over how many times any individual left/right value shows up.
+    """
+    max_possible = len(left_values) * len(right_values)
+    if exclude_self:
+        # Rough upper bound once same-value pairs are excluded.
+        max_possible = max(max_possible - len(left_values), 0)
+    if unique_pairs and join_rows > max_possible:
+        print(
+            f"[warn] N-N relation {join_table_name}: requested {join_rows} "
+            f"unique pairs but only {max_possible} distinct pairs are "
+            f"possible; generating {max_possible} instead."
+        )
+        join_rows = max_possible
+
+    pairs_seen: set = set() if unique_pairs else set()
+    edges: list = []
+    attempts = 0
+    while len(edges) < join_rows and attempts < join_rows * 50 + 1000:
+        attempts += 1
+        left_val = rng.choice(left_values)
+        right_val = rng.choice(right_values)
+        if exclude_self and left_val == right_val:
+            continue
+        if unique_pairs:
+            if (left_val, right_val) in pairs_seen:
+                continue
+            pairs_seen.add((left_val, right_val))
+        edges.append((left_val, right_val))
+    return edges
+
+
+def _random_pairs_by_degree(
+    left_values: list, right_values: list,
+    min_per_left, max_per_left, min_per_right, max_per_right,
+    unique_pairs: bool, exclude_self: bool, join_table_name: str,
+    rng: random.Random,
+) -> list:
+    """
+    Degree-controlled N-N strategy: every left/right value is first given
+    its own random target connection count within its [min, max] bound
+    (an unset bound on a side means "no limit" on that side), and edges
+    are then built up randomly, always favoring values that still need
+    more connections, until both sides' targets are used up.
+
+    This is a best-effort greedy fill, not an exact solver -- if the two
+    tables' sizes make the requested bounds infeasible (say, min_per_left
+    needs more distinct right values than exist), some values will end up
+    short of their minimum and a [warn] reports how many.
+    """
+    left_unique = list(dict.fromkeys(left_values))
+    right_unique = list(dict.fromkeys(right_values))
+
+    min_l = int(min_per_left) if min_per_left is not None else 0
+    max_l = (
+        int(max_per_left)
+        if (max_per_left is not None)
+        else len(right_unique)
+    )
+    min_r = int(min_per_right) if min_per_right is not None else 0
+    max_r = (
+        int(max_per_right)
+        if max_per_right is not None
+        else len(left_unique)
+    )
+
+    if min_l > max_l:
+        raise ValueError(
+            f"{join_table_name}: min_per_left ({min_l}) > "
+            f"max_per_left ({max_l})"
+        )
+    if min_r > max_r:
+        raise ValueError(
+            f"{join_table_name}: min_per_right ({min_r}) > "
+            f"max_per_right ({max_r})"
+        )
+
+    remaining_left = {v: rng.randint(min_l, max_l) for v in left_unique}
+    remaining_right = {v: rng.randint(min_r, max_r) for v in right_unique}
+    target_edges = min(sum(remaining_left.values()),
+                       sum(remaining_right.values()))
+
+    achieved_left: dict = {v: 0 for v in left_unique}
+    achieved_right: dict = {v: 0 for v in right_unique}
+    pairs_seen: set = set()
+    edges: list = []
+    attempts = 0
+    max_attempts = target_edges * 30 + 5000
+    while len(edges) < target_edges and attempts < max_attempts:
+        attempts += 1
+        left_active = [v for v, n in remaining_left.items() if n > 0]
+        right_active = [v for v, n in remaining_right.items() if n > 0]
+        if not left_active or not right_active:
+            break
+        # Prioritize whichever values haven't hit their OWN minimum yet,
+        # so the limited edge budget goes to unmet minimums before
+        # anyone gets "bonus" edges beyond their minimum. Without this,
+        # pure random pairing can easily leave some values short even
+        # when the totals are large enough to cover every minimum.
+        left_needy = [v for v in left_active if achieved_left[v] < min_l]
+        right_needy = [v for v in right_active if achieved_right[v] < min_r]
+        left_pool = left_needy or left_active
+        right_pool = right_needy or right_active
+
+        left_val = rng.choice(left_pool)
+        right_val = rng.choice(right_pool)
+        if exclude_self and left_val == right_val:
+            continue
+        if unique_pairs and (left_val, right_val) in pairs_seen:
+            continue
+        if unique_pairs:
+            pairs_seen.add((left_val, right_val))
+        remaining_left[left_val] -= 1
+        remaining_right[right_val] -= 1
+        achieved_left[left_val] += 1
+        achieved_right[right_val] += 1
+        edges.append((left_val, right_val))
+
+    short_left = sum(
+        1 for v in left_unique if achieved_left.get(v, 0) < min_l
+    )
+    short_right = sum(
+        1 for v in right_unique if achieved_right.get(v, 0) < min_r
+    )
+    if short_left or short_right:
+        print(
+            f"[warn] N-N relation {join_table_name}: could not fully "
+            f"satisfy degree minimums -- {short_left} left value(s) below "
+            f"min_per_left={min_l}, {short_right} right value(s) below "
+            f"min_per_right={min_r}. Try widening the min/max range, "
+            "relaxing unique_pairs, or adding more rows to the smaller "
+            "table."
+        )
+
+    return edges
 
 
 def apply_relation_many_to_many(
@@ -527,6 +905,21 @@ def apply_relation_many_to_many(
     """
     Generates a brand-new join/bridge table linking `left.field` values
     to `right.field` values. Neither original table is modified.
+
+    Optionally also generates extra per-row columns on the join table
+    itself (via `fields:`), and can rename the two key columns (via
+    `left_as` / `right_as`) or skip self-pairs on a self-join (via
+    `exclude_self: true`).
+
+    Two ways to control how many join rows get generated:
+      - `join_rows` (+ `unique_pairs`): just generate that many random
+        pairs -- the original behavior, no control over any individual
+        value's connection count.
+      - `min_per_left`/`max_per_left`/`min_per_right`/`max_per_right`:
+        control how many times each individual left/right value shows up
+        in the join table. Setting any of these switches into
+        degree-controlled mode (see `_random_pairs_by_degree`); `join_rows`
+        is ignored in that case.
 
     Returns (join_table_name, join_table_columns) so the caller can write
     it out as its own CSV alongside the other tables.
@@ -538,40 +931,62 @@ def apply_relation_many_to_many(
     right_values = tables[right_table][right_field]
 
     join_table_name = rel.get("join_table", f"{left_table}_{right_table}")
-    default_join_rows = max(len(left_values), len(right_values))
-    join_rows = int(rel.get("join_rows", default_join_rows))
     unique_pairs = rel.get("unique_pairs", True)
+    exclude_self = rel.get("exclude_self", False)
 
-    left_col = f"{left_table}_{left_field}"
-    right_col = f"{right_table}_{right_field}"
+    left_col = rel.get("left_as", f"{left_table}_{left_field}")
+    right_col = rel.get("right_as", f"{right_table}_{right_field}")
+    extra_field_specs: dict = rel.get("fields", {}) or {}
 
-    pairs: set[tuple] | None = set() if unique_pairs else None
+    min_per_left = rel.get("min_per_left")
+    max_per_left = rel.get("max_per_left")
+    min_per_right = rel.get("min_per_right")
+    max_per_right = rel.get("max_per_right")
+    degree_controlled = any(
+        v is not None
+        for v in (min_per_left, max_per_left, min_per_right, max_per_right)
+    )
+
+    if degree_controlled:
+        edges = _random_pairs_by_degree(
+            left_values, right_values,
+            min_per_left, max_per_left, min_per_right, max_per_right,
+            unique_pairs, exclude_self, join_table_name, rng,
+        )
+    else:
+        default_join_rows = max(len(left_values), len(right_values))
+        join_rows = int(rel.get("join_rows", default_join_rows))
+        edges = _random_pairs_by_count(
+            left_values, right_values, join_rows,
+            unique_pairs, exclude_self, join_table_name, rng,
+        )
+
     left_out: list[Any] = []
     right_out: list[Any] = []
+    extra_columns: dict[str, list] = {name: [] for name in extra_field_specs}
+    extra_used_values: dict[str, set] = {
+        name: set()
+        for name, spec in extra_field_specs.items()
+        if spec.get("unique", False)
+    }
 
-    max_possible = len(left_values) * len(right_values)
-    if unique_pairs and join_rows > max_possible:
-        print(
-            f"[warn] N-N relation {join_table_name}: requested {join_rows} "
-            f"unique pairs but only {max_possible} distinct pairs are "
-            f"possible; generating {max_possible} instead."
-        )
-        join_rows = max_possible
+    for left_val, right_val in edges:
+        row: dict = {left_col: left_val, right_col: right_val}
+        for field_name, field_spec in extra_field_specs.items():
+            used_values = extra_used_values.get(field_name, set())
+            value = generate_field_value(
+                field_name, field_spec, rng, used_values, row
+            )
+            row[field_name] = value
 
-    attempts = 0
-    while len(left_out) < join_rows and attempts < join_rows * 50 + 1000:
-        attempts += 1
-        left_val: Any = rng.choice(left_values)
-        right_val: Any = rng.choice(right_values)
-        if unique_pairs:
-            assert pairs is not None
-            if (left_val, right_val) in pairs:
-                continue
-            pairs.add((left_val, right_val))
         left_out.append(left_val)
         right_out.append(right_val)
+        for field_name in extra_field_specs:
+            extra_columns[field_name].append(row[field_name])
 
-    return join_table_name, {left_col: left_out, right_col: right_out}
+    columns = {left_col: left_out, right_col: right_out}
+    columns.update(extra_columns)
+    return join_table_name, columns
 
 
 def apply_relations(tables: dict, relations: list, rng: random.Random) -> dict:

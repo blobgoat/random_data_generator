@@ -1,11 +1,17 @@
 # config.example.yaml
 #
-# Example config for generate_data.py. It defines three tables:
-#   - users          100 rows, with a unique numeric id and a random name
+# Example config for generate_data.py. It defines four tables:
+#   - users          100 rows, with a unique numeric id, a random name,
+#                     contact info (phone/address), and an optional
+#                     (nullable) loyalty note
 #   - products         8 static rows (named products), each with a
 #                       random unique id and a random price
-#   - orders         300 rows, referencing users (1-N) and linked to
-#                     products through a many-to-many join table
+#   - orders         300 rows, referencing users (1-N, 1-8 orders per
+#                    user) and linked to products through a many-to-many
+#                    join table with its own "quantity" column
+#   - referrals      a self-join of users onto users, showing how one
+#                    user can refer up to 3 others (and every referred
+#                    user has at most one referrer)
 #
 # Run it with (from the project root):
 #   python generate_data.py --config input/config.example.yaml --outdir ./output --seed 42
@@ -22,6 +28,10 @@ tables:
         type: name
       email:
         type: email
+      phone:
+        type: phone
+      address:
+        type: address
       signup_date:
         type: date
         start: "2022-01-01"
@@ -31,6 +41,11 @@ tables:
       plan_tier:
         type: choice # picks one of these strings at random
         values: ["free", "basic", "pro", "enterprise"]
+      loyalty_note:
+        type: text
+        nullable: true # most users don't have one -- this is blank ("")
+        null_chance: 0.8 # 80% of the time, 20% get an actual note
+        sentences: 1
 
   products:
     # `static_rows` hard-codes the product catalog by name -- row count
@@ -82,7 +97,10 @@ tables:
 relations:
   # One user (the "1" side) can place many orders (the "N" side).
   # This adds a new "user_id" column to `orders`, filled with values
-  # drawn from `users.user_id`.
+  # drawn from `users.user_id`. min_per_left/max_per_left keep every
+  # user's order count between 1 and 8 instead of leaving it to pure
+  # chance -- omit both and each order would just pick any user
+  # independently, with no guarantee everyone gets at least one.
   - type: "1-N"
     left:
       table: users
@@ -90,11 +108,16 @@ relations:
     right:
       table: orders
       field: user_id
+    min_per_left: 1
+    max_per_left: 8
 
   # Orders and products are many-to-many (an order can contain several
   # products, and a product can appear on many orders), so this creates
-  # a brand-new join table `orders_products.csv` instead of touching
-  # either original table.
+  # a brand-new join table `order_products.csv` instead of touching
+  # either original table. `left_as`/`right_as` give the two key columns
+  # friendlier names than the "orders_order_id" default, and `fields`
+  # attaches a "quantity" column to each join row -- an attribute of the
+  # relationship itself, not of either order or product.
   - type: "N-N"
     left:
       table: orders
@@ -102,6 +125,35 @@ relations:
     right:
       table: products
       field: product_id
-    join_table: orders_products
-    join_rows: 600
+    join_table: order_products
+    left_as: order_id
+    right_as: product_id
     unique_pairs: true
+    min_per_left: 1 # every order has 1-4 line items
+    max_per_left: 4
+    fields:
+      quantity:
+        type: number
+        digits: 1
+
+  # A self-join of `users` onto itself: one user can refer several
+  # others. `exclude_self: true` stops a user from referring themselves.
+  # min_per_right/max_per_right of 0/1 keep each referred user capped at
+  # a single referrer, while min_per_left/max_per_left of 0/3 let each
+  # referrer bring in up to 3 people (many users refer no one at all).
+  - type: "N-N"
+    left:
+      table: users
+      field: user_id
+    right:
+      table: users
+      field: user_id
+    join_table: referrals
+    left_as: referrer_id
+    right_as: referred_user_id
+    unique_pairs: true
+    exclude_self: true
+    min_per_left: 0
+    max_per_left: 3
+    min_per_right: 0
+    max_per_right: 1

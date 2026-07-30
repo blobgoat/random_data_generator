@@ -29,6 +29,18 @@ foreign-key relationships between tables.
    This writes one CSV per table (plus any join tables from many-to-many
    relations) into `./output`.
 
+3. **(Optional) Dev requirements**: only needed if you want to
+   type-check the script, not to run it. `requirements-dev.txt` installs:
+   - `mypy` — the type checker itself
+   - `types-PyYAML` — type stubs for `pyyaml`, so mypy can check the
+     `import yaml` in `generate_data.py` instead of erroring with
+     "Library stubs not installed for 'yaml'"
+
+   ```bash
+   pip install -r requirements-dev.txt
+   mypy generate_data.py
+   ```
+
 ### Command-line flags
 
 | Flag | Required | Description |
@@ -83,11 +95,37 @@ tables:
 |---|---|---|
 | `name` | — | Full name. Realistic if `faker` is installed. |
 | `email` | — | Random email address. Realistic if `faker` is installed. |
+| `phone` | — | Random phone number. Realistic if `faker` is installed. |
+| `address` | — | Random single-line street address. Realistic if `faker` is installed. |
+| `text` | `sentences: <int>` (default 1) | Random free-text sentence(s) — handy for notes, abstracts, descriptions. |
 | `number` | `digits: <int>` | Random integer with that many digits (e.g. `digits: 4` → 1000–9999). |
 | `boolean` | — | Random `True`/`False`. |
 | `date` | `start: "YYYY-MM-DD"`, `end: "YYYY-MM-DD"` | Random date in range. Both optional (defaults: `2000-01-01` to today). |
 | `choice` | `values: [string, ...]` | **Custom type** — picks one of your strings at random for each row. See below. |
 | `hash` | `fields: [string, ...]`, `algorithm`, `length`, `encoding` | Combines other fields from the same row into one deterministic hash — handy as a composite UID. See below. |
+
+Every field type above also accepts `nullable`/`null_chance` (see below)
+and `unique: true`.
+
+### 2a. Making any field nullable
+
+Add `nullable: true` to any field (of any type) to make it blank (`""`)
+some of the time instead of always calling its generator. Set
+`null_chance` (default `0.5`) to control how often — it's the
+probability of being blank on any given row:
+
+```yaml
+fields:
+  date_completed:
+    type: date
+    nullable: true
+    null_chance: 0.6   # 60% chance of being blank; 40% chance of a date
+    start: "2026-01-01"
+    end: "2026-07-30"
+```
+
+A blank value never counts against `unique: true` — same as how a real
+database allows more than one `NULL` in a `UNIQUE` column.
 
 ### 3. The `choice` type (custom values)
 
@@ -273,20 +311,121 @@ relations:
 |---|---|
 | `1-1` | Every row in `right` gets a distinct value from `left`'s key column. A new column is created on `right`. |
 | `1-N` | Many rows in `right` can share the same `left` value (normal foreign key). A new column is created on `right`. |
-| `N-N` | Neither table is modified. Instead, a brand-new join-table CSV is generated with random pairs of `left.field` and `right.field`. Configure with `join_table` (output name), `join_rows` (row count), and `unique_pairs` (default `true`, no duplicate pairs). |
+| `N-N` | Neither table is modified. Instead, a brand-new join-table CSV is generated with pairs of `left.field` and `right.field`. |
 
 For `1-1`/`1-N`, `left.field` and `right.field` must already exist as a
 column on `left` (usually a `unique: true` id field) — `right.field` is
 the *new* column name that gets created for you. For `N-N`, both fields
 must already exist on their respective tables.
 
-## Full example
+#### Controlling how many connections each row gets
 
-See [`input/config.example.yaml`](./input/config.example.yaml) for a
-complete, runnable config with three tables (`users`, `products`,
-`orders`), a `1-N` relation, an `N-N` relation, two `choice` fields
-(`plan_tier`, `status`), a `hash` field (`row_uid`), and a `static_rows`
-product catalog with a randomly generated id and price per product.
+By default, `1-N` just has each `right` row independently pick any
+`left` value at random, and `N-N` just throws `join_rows` random pairs
+at the wall — neither guarantees anything about how many connections any
+individual row ends up with.
+
+Set `min_per_left`/`max_per_left` (on `1-N` or `N-N`) — and, for `N-N`
+only, `min_per_right`/`max_per_right` — to instead guarantee a
+connection count in that range for every value on that side:
+
+```yaml
+relations:
+  # Every user has 1-8 orders (instead of a random, uncontrolled spread).
+  - type: "1-N"
+    left: { table: users, field: user_id }
+    right: { table: orders, field: user_id }
+    min_per_left: 1
+    max_per_left: 8
+
+  # Every role requires 3-8 skills; every skill is required by 5-40 roles.
+  - type: "N-N"
+    left: { table: roles, field: role_id }
+    right: { table: skills, field: skill_id }
+    join_table: required_skills
+    min_per_left: 3
+    max_per_left: 8
+    min_per_right: 5
+    max_per_right: 40
+```
+
+Any of the four `N-N` bounds can be set independently — an unset bound
+just means "no limit" on that side. Setting any of them switches that
+relation from the old "just generate `join_rows` random pairs" mode
+(which is still the default when none of these are set) into a
+degree-controlled mode: each value's own target connection count is
+picked at random within its `[min, max]`, and edges are built up
+prioritizing whichever values haven't hit their minimum yet.
+
+This is a best-effort process, not an exact solver — if the two tables'
+sizes make the requested bounds mathematically infeasible (e.g.
+`min_per_left` needs more distinct right-side values than exist), you'll
+get a `[warn]` reporting how many values fell short, and you should
+widen the range, loosen `unique_pairs`, or add more rows to the smaller
+table.
+
+#### Attaching extra columns to an `N-N` join table
+
+`N-N` relations can also carry their own attributes — properties of the
+*relationship* itself, not of either table individually (a required
+skill's proficiency level, an order line's quantity, a succession
+candidate's readiness score). Add a `fields:` block using the exact same
+mini-language as a table's `fields:`:
+
+```yaml
+relations:
+  - type: "N-N"
+    left: { table: orders, field: order_id }
+    right: { table: products, field: product_id }
+    join_table: order_products
+    fields:
+      quantity:
+        type: number
+        digits: 1
+```
+
+`fields:` can also use `type: hash` to build a composite key out of both
+sides of the link — see
+[`input/config.succession_planning.yaml`](./input/config.succession_planning.yaml)'s
+`Successor_Candidates` relation, which hashes `role_id` + `candidate_key`
+together into a `successor_id` column.
+
+#### Renaming join columns and self-joins
+
+`left_as`/`right_as` (available on `N-N`) rename the two key columns in
+the join table — handy since the default (`"<table>_<field>"`) can be
+verbose, and necessary if you want a specific column name like `role_id`
+rather than `Role_role_id`. `exclude_self: true` is for self-joins (when
+`left.table` and `right.table` are the same table, e.g. an org chart's
+"reports to" relationship) and stops a row from ever being paired with
+itself:
+
+```yaml
+relations:
+  - type: "N-N"
+    left: { table: roles, field: role_id }
+    right: { table: roles, field: role_id }
+    join_table: reporting_lines
+    left_as: role_id
+    right_as: reports_to
+    exclude_self: true
+    min_per_left: 0
+    max_per_left: 3
+```
+
+## Full examples
+
+- [`input/config.example.yaml`](./input/config.example.yaml) — a compact
+  tour of most features: four tables (`users`, `products`, `orders`,
+  `referrals`), a degree-bounded `1-N` relation, an `N-N` relation with
+  its own `quantity` column and renamed key columns, a self-join `N-N`
+  with `exclude_self`, `choice` fields, a `hash` field, a `nullable`
+  field, and a `static_rows` product catalog.
+- [`input/config.succession_planning.yaml`](./input/config.succession_planning.yaml)
+  — a larger, real-world-shaped example (an HR succession-planning data
+  model: roles, candidates, skills, goals, and six relationship tables)
+  that leans on degree-bounded relations throughout and a hashed
+  composite primary key on one of its join tables.
 
 ## Extending it
 
@@ -296,3 +435,5 @@ register it in the `FIELD_GENERATORS` dict — see the comment above that
 dict for details. `row` gives you the values already generated for
 other fields in the same row (see `gen_hash` for an example that uses
 it).
+
+See [`CHANGELOG.md`](./CHANGELOG.md) for a history of what's been added.
